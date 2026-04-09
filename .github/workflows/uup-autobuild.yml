@@ -21,7 +21,7 @@ on:
       arch:
         description: Comma-separated architectures
         required: false
-        default: amd64
+        default: amd64,arm64
         type: string
       search_term:
         description: Search keyword used when filtering the latest Windows build
@@ -56,7 +56,7 @@ jobs:
 
           $defaultChannels = @('RETAIL', 'WIF', 'WIS', 'CANARY')
           $defaultLanguages = @('zh-cn', 'en-us')
-          $defaultArchitectures = @('amd64')
+          $defaultArchitectures = @('amd64', 'arm64')
           $searchTerm = if ([string]::IsNullOrWhiteSpace($searchInput)) { 'Windows' } else { $searchInput.Trim() }
 
           $channelMap = @{
@@ -95,16 +95,16 @@ jobs:
 
           $include = [System.Collections.ArrayList]::new()
 
-          foreach ($channel in $channels) {
-            if (-not $channelMap.ContainsKey($channel)) {
-              Write-Warning "Skipping unsupported channel input: $channel"
-              continue
-            }
+          foreach ($architecture in $architectures) {
+            foreach ($channel in $channels) {
+              if (-not $channelMap.ContainsKey($channel)) {
+                Write-Warning "Skipping unsupported channel input: $channel"
+                continue
+              }
 
-            $ring = $channelMap[$channel].ring
-            $flight = $channelMap[$channel].flight
+              $ring = $channelMap[$channel].ring
+              $flight = $channelMap[$channel].flight
 
-            foreach ($architecture in $architectures) {
               foreach ($language in $languages) {
                 $metadataPath = Join-Path $env:RUNNER_TEMP "$channel-$architecture-$language-latest.json"
 
@@ -276,7 +276,7 @@ jobs:
 
           Push-Location -LiteralPath $packageRoot
           try {
-            cmd.exe /d /c """$downloadScript"" 49127c4b-02dc-482e-ac4f-ec4d659b7547"
+            & $downloadScript
             if ($LASTEXITCODE -ne 0) {
               throw "uup_download_windows.cmd failed with exit code $LASTEXITCODE"
             }
@@ -348,7 +348,7 @@ jobs:
             gh release create $env:TAG_NAME $isoPath --title $releaseTitle --notes-file $releaseNotesPath --repo $env:GITHUB_REPOSITORY
           }
 
-  Finalize:
+  finalize:
     name: Finalize Workflow
     needs: Build
     runs-on: ubuntu-latest
