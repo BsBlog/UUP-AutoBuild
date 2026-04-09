@@ -7,13 +7,12 @@ param(
     [int]$Sku = 48,
     [string]$Build = 'latest',
     [string]$Type = 'Production',
-    [string]$SearchTerm = 'Windows 11',
+    [string]$SearchTerm = 'Windows',
     [Parameter(Mandatory)]
     [string]$Language,
     [string]$Edition = 'PROFESSIONAL',
     [Parameter(Mandatory)]
     [string]$OutputPath,
-    [string]$ProxyUrl,
     [int]$MaxCandidates = 40
 )
 
@@ -104,7 +103,7 @@ function Resolve-UupCandidate {
     )
 
     $langUri = '{0}/listlangs.php?id={1}' -f $script:UupApiBase, [uri]::EscapeDataString($UpdateId)
-    $langResponse = Get-UupApiResponse -Uri $langUri -ProxyUrl $ProxyUrl
+    $langResponse = Get-UupApiResponse -Uri $langUri
 
     if (-not ($langResponse.langList -contains $Language)) {
         return $null
@@ -134,7 +133,7 @@ function Resolve-UupCandidate {
         [uri]::EscapeDataString($UpdateId), `
         [uri]::EscapeDataString($Language)
 
-    $editionResponse = Get-UupApiResponse -Uri $editionUri -ProxyUrl $ProxyUrl
+    $editionResponse = Get-UupApiResponse -Uri $editionUri
 
     if (-not ($editionResponse.editionList -contains $Edition)) {
         return $null
@@ -168,7 +167,7 @@ $liveFetchUri = '{0}/fetchupd.php?arch={1}&ring={2}&flight={3}&build={4}&sku={5}
 
 try {
     Write-UupLog "Trying live fetch for $Ring / $Language"
-    $liveResponse = Get-UupApiResponse -Uri $liveFetchUri -ProxyUrl $ProxyUrl -MaxRetries 2
+    $liveResponse = Get-UupApiResponse -Uri $liveFetchUri -MaxRetries 2
 
     if ($liveResponse.ContainsKey('updateId')) {
         $candidate = Resolve-UupCandidate -UpdateId ([string]$liveResponse.updateId) -Source 'fetchupd'
@@ -188,7 +187,7 @@ $listUri = '{0}/listid.php?search={1}&sortByDate=1' -f `
     $script:UupApiBase, `
     [uri]::EscapeDataString($SearchTerm)
 
-$listResponse = Get-UupApiResponse -Uri $listUri -ProxyUrl $ProxyUrl
+$listResponse = Get-UupApiResponse -Uri $listUri
 
 $buildItems = @()
 if ($listResponse.builds -is [hashtable]) {

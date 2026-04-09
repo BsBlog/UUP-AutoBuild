@@ -6,7 +6,7 @@ on:
       force_build:
         description: Rebuild even if the same channel/language/build tag already exists
         required: false
-        default: false
+        default: true
         type: boolean
       channels:
         description: Comma-separated channels
@@ -26,7 +26,7 @@ on:
       search_term:
         description: Search keyword used when filtering the latest Windows build
         required: false
-        default: Windows 11
+        default: Windows
         type: string
   schedule:
     - cron: "0 3 * * *"
@@ -57,7 +57,7 @@ jobs:
           $defaultChannels = @('RETAIL', 'WIF', 'WIS', 'CANARY')
           $defaultLanguages = @('zh-cn', 'en-us')
           $defaultArchitectures = @('amd64', 'arm64')
-          $searchTerm = if ([string]::IsNullOrWhiteSpace($searchInput)) { 'Windows 11' } else { $searchInput.Trim() }
+          $searchTerm = if ([string]::IsNullOrWhiteSpace($searchInput)) { 'Windows' } else { $searchInput.Trim() }
 
           $channelMap = @{
             RETAIL = @{ ring = 'RETAIL'; flight = 'Active' }

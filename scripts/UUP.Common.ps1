@@ -65,8 +65,6 @@ function Invoke-UupApiRequest {
         [Parameter(Mandatory)]
         [string]$Uri,
 
-        [string]$ProxyUrl,
-
         [int]$MaxRetries = 6
     )
 
@@ -78,10 +76,6 @@ function Invoke-UupApiRequest {
                 Headers            = @{ 'User-Agent' = $script:UupUserAgent }
                 TimeoutSec         = 180
                 SkipHttpErrorCheck = $true
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
-                $requestParams.Proxy = $ProxyUrl
             }
 
             $response = Invoke-WebRequest @requestParams
@@ -140,74 +134,16 @@ function Get-UupApiResponse {
         [Parameter(Mandatory)]
         [string]$Uri,
 
-        [string]$ProxyUrl,
-
         [int]$MaxRetries = 6
     )
 
-    $payload = Invoke-UupApiRequest -Uri $Uri -ProxyUrl $ProxyUrl -MaxRetries $MaxRetries
+    $payload = Invoke-UupApiRequest -Uri $Uri -MaxRetries $MaxRetries
 
     if (-not $payload.ContainsKey('response')) {
         throw "Unexpected UUP API payload: missing response key."
     }
 
     return $payload.response
-}
-
-function Invoke-VerifiedDownload {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Uri,
-
-        [Parameter(Mandatory)]
-        [string]$Destination,
-
-        [string]$Sha256,
-
-        [string]$ProxyUrl
-    )
-
-    $destinationDirectory = Split-Path -Path $Destination -Parent
-    Ensure-Directory -Path $destinationDirectory | Out-Null
-
-    $normalizedHash = if ([string]::IsNullOrWhiteSpace($Sha256)) { $null } else { $Sha256.ToLowerInvariant() }
-
-    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-        if ($normalizedHash) {
-            $existingHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($existingHash -eq $normalizedHash) {
-                Write-UupLog "Using cached file $Destination"
-                return
-            }
-        } else {
-            Write-UupLog "Using cached file $Destination"
-            return
-        }
-    }
-
-    Write-UupLog "Downloading $Uri"
-
-    $requestParams = @{
-        Uri         = $Uri
-        OutFile     = $Destination
-        Headers     = @{ 'User-Agent' = $script:UupUserAgent }
-        TimeoutSec  = 600
-        ErrorAction = 'Stop'
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
-        $requestParams.Proxy = $ProxyUrl
-    }
-
-    Invoke-WebRequest @requestParams
-
-    if ($normalizedHash) {
-        $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actualHash -ne $normalizedHash) {
-            throw "Checksum mismatch for $Destination"
-        }
-    }
 }
 
 function New-UupConvertConfig {

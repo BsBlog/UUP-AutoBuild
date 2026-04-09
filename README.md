@@ -1,49 +1,57 @@
 # UUP AutoBuild
 
-这个仓库提供一个 GitHub Actions 工作流，用来自动查询 UUP dump 上最新的 Windows 构建，并下载 UUP dump 官方生成的转换压缩包，直接运行包内 `uup_download_windows.cmd` 自动生成 ISO。
+This repository provides a GitHub Actions workflow that automatically finds the latest Windows builds on UUP dump, downloads the official UUP dump conversion package, and runs the bundled `uup_download_windows.cmd` script to generate ISO images.
 
-当前默认行为：
+## Default Behavior
 
-- 渠道：`RETAIL`、`WIF`、`WIS`、`CANARY`
-- 语言：`zh-cn`、`en-us`
-- 版本：`PROFESSIONAL`
-- 架构：`amd64`、`arm64`
-- 转换选项：
-  - 集成更新
-  - 运行组件清理
-  - 集成 `.NET Framework 3.5`
-  - 使用固实压缩 `ESD`
+- Channels: `RETAIL`, `WIF`, `WIS`, `CANARY`
+- Languages: `zh-cn`, `en-us`
+- Edition: `PROFESSIONAL`
+- Architectures: `amd64`, `arm64`
+- Conversion options:
+  - Include updates
+  - Run component cleanup
+  - Integrate `.NET Framework 3.5`
+  - Use solid `ESD` compression
 
-## 工作流说明
+## Workflow
 
-工作流文件：`.github/workflows/uup-autobuild.yml`
+Workflow file: `.github/workflows/uup-autobuild.yml`
 
-触发方式：
+Triggers:
 
-- 手动运行 `workflow_dispatch`
-- 每天自动运行一次
+- Manual run via `workflow_dispatch`
+- Daily scheduled run
 
-为了避免重复构建，工作流会按 `渠道 + build + 架构 + 语言 + 版本` 生成 tag。相同组合下次会自动跳过；如果要强制重新构建，可以在手动运行时启用 `force_build`。
+To avoid rebuilding the same result repeatedly, the workflow creates a tag based on `channel + build + architecture + language + edition`. If the same tag already exists, that combination is skipped unless `force_build` is enabled.
 
-## 可选输入
+## Manual Inputs
 
-手动运行时支持以下输入：
+The workflow supports these inputs when started manually:
 
-- `force_build`：即使已有相同 tag 也重新构建
-- `channels`：逗号分隔，默认 `RETAIL,WIF,WIS,CANARY`
-- `languages`：逗号分隔，默认 `zh-cn,en-us`
-- `arch`：逗号分隔，默认 `amd64,arm64`
-- `search_term`：默认 `Windows 11`
+- `force_build`: rebuild even if the same tag already exists
+- `channels`: comma-separated list, default `RETAIL,WIF,WIS,CANARY`
+- `languages`: comma-separated list, default `zh-cn,en-us`
+- `arch`: comma-separated list, default `amd64,arm64`
+- `search_term`: default `Windows`
 
-`search_term` 用来辅助筛选“最新的 Windows 客户端构建”。如果你后面想改成 Windows 10，可以把它改成 `Windows 10`。
+`search_term` is used to help filter the latest client build. By default it is not pinned to `Windows 11`, so the workflow tracks the latest Windows client build available for the selected channel. If you want to target a specific generation such as Windows 10, set it to `Windows 10`.
 
-## 产物
+## Build Location
 
-每次成功构建后会：
+The working directory used during the build is:
 
-- 上传 ISO 到 Actions artifact
-- 上传 ISO 到对应 tag 的 GitHub Release
+- `D:\UUP-Dump\<tag>`
 
-## 语言说明
+This keeps the download, extraction, and conversion process on the larger `D:` drive.
 
-由于 UUP dump 的 `Any Language` 不能直接配合专业版 edition 过滤，这个工作流默认把 `zh-cn` 和 `en-us` 作为两个独立构建目标分别生成 ISO，而不是把两个语言合并进同一个镜像。
+## Outputs
+
+For each successful build, the workflow:
+
+- uploads the generated ISO to GitHub Actions artifacts
+- publishes the ISO to the matching GitHub Release tag
+
+## Language Note
+
+UUP dump's `Any Language` option cannot be cleanly combined with edition filtering for `PROFESSIONAL`, so this workflow builds `zh-cn` and `en-us` as separate ISO outputs rather than merging both languages into a single image.
