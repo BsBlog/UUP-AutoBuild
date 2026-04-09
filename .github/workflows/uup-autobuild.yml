@@ -216,6 +216,7 @@ jobs:
 
       - name: Download Official Package And Build ISO
         id: build
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
 
