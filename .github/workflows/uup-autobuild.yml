@@ -21,7 +21,7 @@ on:
       arch:
         description: Comma-separated architectures
         required: false
-        default: amd64,arm64
+        default: amd64
         type: string
       search_term:
         description: Search keyword used when filtering the latest Windows build
@@ -56,7 +56,7 @@ jobs:
 
           $defaultChannels = @('RETAIL', 'WIF', 'WIS', 'CANARY')
           $defaultLanguages = @('zh-cn', 'en-us')
-          $defaultArchitectures = @('amd64', 'arm64')
+          $defaultArchitectures = @('amd64')
           $searchTerm = if ([string]::IsNullOrWhiteSpace($searchInput)) { 'Windows' } else { $searchInput.Trim() }
 
           $channelMap = @{
@@ -192,30 +192,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@main
 
-      - name: Disk Space Before Cleanup
-        shell: pwsh
-        run: Get-PSDrive -PSProvider FileSystem | Sort-Object Name | Format-Table -Auto
+      # - name: Disk Space Before Cleanup
+      #   shell: pwsh
+      #   run: Get-PSDrive -PSProvider FileSystem | Sort-Object Name | Format-Table -Auto
 
-      - name: Free Disk Space
-        shell: pwsh
-        run: |
-          $paths = @(
-            'C:\Program Files\Android',
-            'C:\Program Files (x86)\Android',
-            'C:\hostedtoolcache\windows\Python',
-            'C:\hostedtoolcache\windows\Ruby',
-            'C:\hostedtoolcache\windows\Go',
-            'C:\hostedtoolcache\windows\CodeQL'
-          )
+      # - name: Free Disk Space
+      #   shell: pwsh
+      #   run: |
+      #     $paths = @(
+      #       'C:\Program Files\Android',
+      #       'C:\Program Files (x86)\Android',
+      #       'C:\hostedtoolcache\windows\Python',
+      #       'C:\hostedtoolcache\windows\Ruby',
+      #       'C:\hostedtoolcache\windows\Go',
+      #       'C:\hostedtoolcache\windows\CodeQL'
+      #     )
 
-          foreach ($path in $paths) {
-            if (Test-Path -LiteralPath $path) {
-              Write-Host "Removing $path"
-              Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
-            }
-          }
+      #     foreach ($path in $paths) {
+      #       if (Test-Path -LiteralPath $path) {
+      #         Write-Host "Removing $path"
+      #         Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+      #       }
+      #     }
 
-          Get-PSDrive -PSProvider FileSystem | Sort-Object Name | Format-Table -Auto
+      #     Get-PSDrive -PSProvider FileSystem | Sort-Object Name | Format-Table -Auto
 
       - name: Download Official Package And Build ISO
         id: build

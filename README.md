@@ -7,7 +7,7 @@ This repository provides a GitHub Actions workflow that automatically finds the 
 - Channels: `RETAIL`, `WIF`, `WIS`, `CANARY`
 - Languages: `zh-cn`, `en-us`
 - Edition: `PROFESSIONAL`
-- Architectures: `amd64`, `arm64`
+- Architectures: `amd64`
 - Conversion options:
   - Include updates
   - Run component cleanup
@@ -32,7 +32,7 @@ The workflow supports these inputs when started manually:
 - `force_build`: rebuild even if the same tag already exists
 - `channels`: comma-separated list, default `RETAIL,WIF,WIS,CANARY`
 - `languages`: comma-separated list, default `zh-cn,en-us`
-- `arch`: comma-separated list, default `amd64,arm64`
+- `arch`: comma-separated list, default `amd64`
 - `search_term`: default `Windows`
 
 `search_term` is used to help filter the latest client build. By default it is not pinned to `Windows 11`, so the workflow tracks the latest Windows client build available for the selected channel. If you want to target a specific generation such as Windows 10, set it to `Windows 10`.
