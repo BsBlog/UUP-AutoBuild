@@ -1,4 +1,4 @@
-$script:UupApiBase = 'https://api.uupdump.net'
+$script:UupBaseUrl = 'https://uupdump.net'
 $script:UupUserAgent = 'UUP-AutoBuild/1.0'
 
 function Write-UupLog {
@@ -23,31 +23,14 @@ function Ensure-Directory {
     return (Resolve-Path -LiteralPath $Path).Path
 }
 
-function ConvertTo-UupFlag {
+function ConvertFrom-UupHtmlText {
     param(
         [Parameter(Mandatory)]
-        [bool]$Value
+        [string]$Text
     )
 
-    if ($Value) {
-        return 1
-    }
-
-    return 0
-}
-
-function ConvertTo-SafeFileName {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name
-    )
-
-    $safeName = $Name
-    foreach ($char in [System.IO.Path]::GetInvalidFileNameChars()) {
-        $safeName = $safeName.Replace([string]$char, '_')
-    }
-
-    return ($safeName -replace '\s+', '_')
+    $decodedText = [System.Net.WebUtility]::HtmlDecode($Text)
+    return ([regex]::Replace($decodedText, '\s+', ' ')).Trim()
 }
 
 function Get-UupRetryDelaySeconds {
@@ -59,14 +42,64 @@ function Get-UupRetryDelaySeconds {
     return [Math]::Min(90, [int]([Math]::Pow(2, $Attempt) * 3))
 }
 
-function Invoke-UupApiRequest {
+function Test-UupTransientWebPage {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Content
+    )
+
+    $transientPatterns = @(
+        'You are being rate limited',
+        'Just a moment\.\.\.',
+        'Enable JavaScript and cookies to continue'
+    )
+
+    foreach ($pattern in $transientPatterns) {
+        if ($Content -match $pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-UupWebCachePath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    $cacheRoot = Ensure-Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) 'UUP-Dump-WebCache')
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $hashBytes = $sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Uri))
+    } finally {
+        $sha1.Dispose()
+    }
+
+    $hashString = [System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+    return (Join-Path $cacheRoot "$hashString.html")
+}
+
+function Get-UupWebContent {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string]$Uri,
 
-        [int]$MaxRetries = 6
+        [int]$MaxRetries = 6,
+
+        [int]$CacheTtlMinutes = 30
     )
+
+    $cachePath = Get-UupWebCachePath -Uri $Uri
+
+    if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
+        $cacheAgeMinutes = ((Get-Date) - (Get-Item -LiteralPath $cachePath).LastWriteTime).TotalMinutes
+        if ($cacheAgeMinutes -lt $CacheTtlMinutes) {
+            return (Get-Content -LiteralPath $cachePath -Raw)
+        }
+    }
 
     for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
         try {
@@ -77,35 +110,19 @@ function Invoke-UupApiRequest {
                 TimeoutSec         = 180
                 SkipHttpErrorCheck = $true
             }
-
             $response = Invoke-WebRequest @requestParams
+
             $statusCode = [int]$response.StatusCode
-            $payloadText = [string]$response.Content
-            $payload = if ([string]::IsNullOrWhiteSpace($payloadText)) {
-                @{}
-            } else {
-                $payloadText | ConvertFrom-Json -AsHashtable -Depth 100
+            $content = [string]$response.Content
+            $isTransientPage = Test-UupTransientWebPage -Content $content
+
+            if ($statusCode -ge 200 -and $statusCode -lt 300 -and -not $isTransientPage) {
+                Set-Content -LiteralPath $cachePath -Value $content -Encoding UTF8
+                return $content
             }
 
-            $apiError = $null
-            if ($payload.ContainsKey('response') -and
-                $payload.response -is [hashtable] -and
-                $payload.response.ContainsKey('error')) {
-                $apiError = [string]$payload.response.error
-            }
-
-            if ($statusCode -ge 200 -and $statusCode -lt 300 -and [string]::IsNullOrWhiteSpace($apiError)) {
-                return $payload
-            }
-
-            $retryable = $statusCode -in @(429, 500, 502, 503, 504) -or $apiError -in @(
-                'USER_RATE_LIMITED',
-                'WU_REQUEST_FAILED',
-                'EMPTY_FILELIST',
-                'NO_UPDATE_FOUND'
-            )
-
-            $reason = if ($apiError) { $apiError } else { "HTTP_$statusCode" }
+            $reason = if ($isTransientPage) { 'WEB_RATE_LIMITED' } else { "HTTP_$statusCode" }
+            $retryable = $isTransientPage -or $statusCode -in @(429, 500, 502, 503, 504)
 
             if ($attempt -ge $MaxRetries -or -not $retryable) {
                 throw "Request to $Uri failed: $reason"
@@ -126,79 +143,4 @@ function Invoke-UupApiRequest {
     }
 
     throw "Request to $Uri failed after $MaxRetries attempts."
-}
-
-function Get-UupApiResponse {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Uri,
-
-        [int]$MaxRetries = 6
-    )
-
-    $payload = Invoke-UupApiRequest -Uri $Uri -MaxRetries $MaxRetries
-
-    if (-not $payload.ContainsKey('response')) {
-        throw "Unexpected UUP API payload: missing response key."
-    }
-
-    return $payload.response
-}
-
-function New-UupConvertConfig {
-    [CmdletBinding()]
-    param(
-        [bool]$AddUpdates = $true,
-        [bool]$Cleanup = $true,
-        [bool]$NetFx3 = $true,
-        [bool]$EsdCompression = $true
-    )
-
-    $updates = ConvertTo-UupFlag -Value $AddUpdates
-    $cleanupValue = ConvertTo-UupFlag -Value $Cleanup
-    $netfx = ConvertTo-UupFlag -Value $NetFx3
-    $esd = ConvertTo-UupFlag -Value $EsdCompression
-
-    return @"
-[convert-UUP]
-AutoStart    =1
-AddUpdates   =$updates
-Cleanup      =$cleanupValue
-ResetBase    =0
-NetFx3       =$netfx
-StartVirtual =0
-wim2esd      =$esd
-wim2swm      =0
-SkipISO      =0
-SkipWinRE    =0
-LCUwinre     =0
-LCUmsuExpand =0
-UpdtBootFiles=0
-ForceDism    =0
-RefESD       =0
-SkipLCUmsu   =0
-SkipEdge     =0
-AutoExit     =1
-DisableUpdatingUpgrade=0
-AddDrivers   =0
-Drv_Source   =\Drivers
-
-[Store_Apps]
-SkipApps     =0
-AppsLevel    =0
-StubAppsFull =0
-CustomList   =0
-
-[create_virtual_editions]
-vUseDism     =1
-vAutoStart   =1
-vDeleteSource=0
-vPreserve    =0
-vwim2esd     =$esd
-vwim2swm     =0
-vSkipISO     =0
-vAutoEditions=
-vSortEditions=
-"@
 }
