@@ -174,6 +174,7 @@ jobs:
     if: ${{ needs.prepare.outputs.build_count != '0' }}
     runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
       CHANNEL: ${{ matrix.channel }}
@@ -323,10 +324,10 @@ jobs:
           name: ${{ steps.build.outputs.artifact_name }}
           path: ${{ steps.build.outputs.iso_path }}
           if-no-files-found: error
-          retention-days: 7
           compression-level: 0
 
-      - name: Publish GitHub Release
+      - name: Prepare Release Assets
+        id: release_assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -335,14 +336,67 @@ jobs:
           $isoPath = "${{ steps.build.outputs.iso_path }}"
           $releaseNotesPath = "${{ steps.build.outputs.release_notes_path }}"
           $releaseTitle = "${{ steps.build.outputs.release_title }}"
+          $outputRoot = Split-Path -Path $isoPath -Parent
+          $workRoot = Split-Path -Path $outputRoot -Parent
+          $packageRoot = Join-Path $workRoot 'package'
+          $releaseAssetDir = Join-Path $outputRoot 'release-assets'
+          $releaseAssetSummary = 'ISO'
 
-          gh release view $env:TAG_NAME --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG_NAME $isoPath --clobber --repo $env:GITHUB_REPOSITORY
-            gh release edit $env:TAG_NAME --title $releaseTitle --notes-file $releaseNotesPath --repo $env:GITHUB_REPOSITORY
-          } else {
-            gh release create $env:TAG_NAME $isoPath --title $releaseTitle --notes-file $releaseNotesPath --repo $env:GITHUB_REPOSITORY
+          if (Test-Path -LiteralPath $releaseAssetDir) {
+            Remove-Item -LiteralPath $releaseAssetDir -Recurse -Force
           }
+          $null = New-Item -ItemType Directory -Path $releaseAssetDir -Force
+
+          $isoItem = Get-Item -LiteralPath $isoPath
+          $releaseAssetSizeLimitBytes = 1900MB
+          if ($isoItem.Length -gt $releaseAssetSizeLimitBytes) {
+            $sevenZipPath = Join-Path $packageRoot 'files\7zr.exe'
+            if (-not (Test-Path -LiteralPath $sevenZipPath -PathType Leaf)) {
+              throw '7zr.exe was not found. Cannot create split ZIP release archives.'
+            }
+
+            $splitArchiveBase = Join-Path $releaseAssetDir ("{0}.zip" -f [System.IO.Path]::GetFileNameWithoutExtension($isoPath))
+            & $sevenZipPath a '-tzip' '-mx=1' '-v1900m' $splitArchiveBase $isoPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "7zr.exe failed with exit code $LASTEXITCODE"
+            }
+
+            $releaseAssetSummary = 'Split ZIP volumes (1.9 GB each)'
+          } else {
+            Copy-Item -LiteralPath $isoPath -Destination (Join-Path $releaseAssetDir (Split-Path -Path $isoPath -Leaf)) -Force
+          }
+
+          $releaseAssets = Get-ChildItem -LiteralPath $releaseAssetDir -File | Sort-Object Name
+          if ($releaseAssets.Count -eq 0) {
+            throw 'No release assets were produced.'
+          }
+
+          $releaseBody = (Get-Content -LiteralPath $releaseNotesPath -Raw).TrimEnd()
+          $releaseBody = $releaseBody + [Environment]::NewLine + "Release Asset Format: $releaseAssetSummary"
+
+          $releaseTags = @(gh release list --repo $env:GITHUB_REPOSITORY --limit 1000 --json tagName --jq '.[].tagName')
+          $releaseTags = @($releaseTags | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+          foreach ($releaseTag in $releaseTags) {
+            Write-Host "Deleting release $releaseTag"
+            gh release delete $releaseTag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "asset_glob=$releaseAssetDir\\*"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "release_body<<__BODY__"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value $releaseBody
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "__BODY__"
+
+      - name: Publish GitHub Release
+        uses: svenstaro/upload-release-action@master
+        with:
+          repo_token: ${{ github.token }}
+          file: ${{ steps.release_assets.outputs.asset_glob }}
+          file_glob: true
+          tag: ${{ env.TAG_NAME }}
+          overwrite: true
+          release_name: ${{ steps.build.outputs.release_title }}
+          body: ${{ steps.release_assets.outputs.release_body }}
 
   finalize:
     name: Finalize Workflow
