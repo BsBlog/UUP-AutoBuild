@@ -1,0 +1,360 @@
+name: UUP Auto Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Rebuild even if the same channel/language/build tag already exists
+        required: false
+        default: false
+        type: boolean
+      channels:
+        description: Comma-separated channels
+        required: false
+        default: RETAIL,WIF,WIS,CANARY
+        type: string
+      languages:
+        description: Comma-separated languages
+        required: false
+        default: zh-cn,en-us
+        type: string
+      arch:
+        description: Comma-separated architectures
+        required: false
+        default: amd64,arm64
+        type: string
+      search_term:
+        description: Search keyword used when filtering the latest Windows build
+        required: false
+        default: Windows 11
+        type: string
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  prepare:
+    name: Prepare Latest Builds
+    runs-on: windows-latest
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      build_count: ${{ steps.prepare.outputs.build_count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Build Matrix
+        id: prepare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $channelInput = "${{ github.event.inputs.channels || '' }}"
+          $languageInput = "${{ github.event.inputs.languages || '' }}"
+          $archInput = "${{ github.event.inputs.arch || '' }}"
+          $searchInput = "${{ github.event.inputs.search_term || '' }}"
+          $forceBuild = "${{ github.event.inputs.force_build || 'false' }}" -eq 'true'
+
+          $defaultChannels = @('RETAIL', 'WIF', 'WIS', 'CANARY')
+          $defaultLanguages = @('zh-cn', 'en-us')
+          $defaultArchitectures = @('amd64', 'arm64')
+          $searchTerm = if ([string]::IsNullOrWhiteSpace($searchInput)) { 'Windows 11' } else { $searchInput.Trim() }
+
+          $channelMap = @{
+            RETAIL = @{ ring = 'RETAIL'; flight = 'Active' }
+            WIF    = @{ ring = 'WIF';    flight = 'Active' }
+            WIS    = @{ ring = 'WIS';    flight = 'Active' }
+            CANARY = @{ ring = 'CANARY'; flight = 'Active' }
+          }
+
+          $channels = if ([string]::IsNullOrWhiteSpace($channelInput)) {
+            $defaultChannels
+          } else {
+            $channelInput.Split(',') |
+              ForEach-Object { $_.Trim().ToUpperInvariant() } |
+              Where-Object { $_ } |
+              Select-Object -Unique
+          }
+
+          $languages = if ([string]::IsNullOrWhiteSpace($languageInput)) {
+            $defaultLanguages
+          } else {
+            $languageInput.Split(',') |
+              ForEach-Object { $_.Trim().ToLowerInvariant() } |
+              Where-Object { $_ } |
+              Select-Object -Unique
+          }
+
+          $architectures = if ([string]::IsNullOrWhiteSpace($archInput)) {
+            $defaultArchitectures
+          } else {
+            $archInput.Split(',') |
+              ForEach-Object { $_.Trim().ToLowerInvariant() } |
+              Where-Object { $_ } |
+              Select-Object -Unique
+          }
+
+          $include = New-Object System.Collections.Generic.List[object]
+
+          foreach ($channel in $channels) {
+            if (-not $channelMap.ContainsKey($channel)) {
+              Write-Warning "Skipping unsupported channel input: $channel"
+              continue
+            }
+
+            $ring = $channelMap[$channel].ring
+            $flight = $channelMap[$channel].flight
+
+            foreach ($architecture in $architectures) {
+              foreach ($language in $languages) {
+                $metadataPath = Join-Path $env:RUNNER_TEMP "$channel-$architecture-$language-latest.json"
+
+                try {
+                  & "$PWD/scripts/Get-UUPLatest.ps1" `
+                    -Arch $architecture `
+                    -Ring $ring `
+                    -Flight $flight `
+                    -Sku 48 `
+                    -SearchTerm $searchTerm `
+                    -Language $language `
+                    -Edition 'PROFESSIONAL' `
+                    -OutputPath $metadataPath
+
+                  $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json -Depth 20
+
+                  $tagName = ('{0}-{1}-{2}-{3}-{4}' -f `
+                    $channel.ToLowerInvariant(), `
+                    $metadata.foundBuild, `
+                    $architecture.ToLowerInvariant(), `
+                    $language.ToLowerInvariant(), `
+                    'professional') -replace '[^0-9A-Za-z._-]', '-'
+
+                  $tagProbe = git ls-remote --tags origin "refs/tags/$tagName"
+                  $tagExists = -not [string]::IsNullOrWhiteSpace(($tagProbe | Out-String).Trim())
+
+                  if ($tagExists -and -not $forceBuild) {
+                    Write-Host "Skipping existing tag $tagName"
+                    continue
+                  }
+
+                  $include.Add([ordered]@{
+                    channel      = $channel
+                    ring         = $ring
+                    flight       = $flight
+                    arch         = $architecture
+                    sku          = 48
+                    language     = $language
+                    edition      = 'PROFESSIONAL'
+                    search_term  = $searchTerm
+                    source       = $metadata.source
+                    update_id    = $metadata.updateId
+                    update_title = $metadata.updateTitle
+                    found_build  = $metadata.foundBuild
+                    tag_name     = $tagName
+                    tag_exists   = $tagExists
+                  })
+                } catch {
+                  Write-Warning "Failed to prepare $channel / $architecture / $language: $($_.Exception.Message)"
+                }
+              }
+            }
+          }
+
+          $matrix = @{ include = @($include) } | ConvertTo-Json -Compress -Depth 20
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "matrix=$matrix"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "build_count=$($include.Count)"
+
+          Write-Host "Preparation completed. Build count: $($include.Count)"
+
+  Build:
+    name: Build ${{ matrix.channel }} ${{ matrix.arch }} ${{ matrix.language }}
+    needs: prepare
+    if: ${{ needs.prepare.outputs.build_count != '0' }}
+    runs-on: windows-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      CHANNEL: ${{ matrix.channel }}
+      UPDATE_ID: ${{ matrix.update_id }}
+      UPDATE_TITLE: ${{ matrix.update_title }}
+      FOUND_BUILD: ${{ matrix.found_build }}
+      RING: ${{ matrix.ring }}
+      FLIGHT: ${{ matrix.flight }}
+      ARCH: ${{ matrix.arch }}
+      SKU: ${{ matrix.sku }}
+      LANGUAGE: ${{ matrix.language }}
+      EDITION: ${{ matrix.edition }}
+      TAG_NAME: ${{ matrix.tag_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Disk Space Before Cleanup
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Sort-Object Name | Format-Table -Auto
+
+      - name: Free Disk Space
+        shell: pwsh
+        run: |
+          $paths = @(
+            'C:\Program Files\Android',
+            'C:\Program Files (x86)\Android',
+            'C:\hostedtoolcache\windows\Python',
+            'C:\hostedtoolcache\windows\Ruby',
+            'C:\hostedtoolcache\windows\Go',
+            'C:\hostedtoolcache\windows\CodeQL'
+          )
+
+          foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path) {
+              Write-Host "Removing $path"
+              Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          Get-PSDrive -PSProvider FileSystem | Sort-Object Name | Format-Table -Auto
+
+      - name: Download Official Package And Build ISO
+        id: build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $workRoot = Join-Path 'D:\UUP-Dump' $env:TAG_NAME
+          $packageRoot = Join-Path $workRoot 'package'
+          $outputRoot = Join-Path $workRoot 'dist'
+          $packageZip = Join-Path $workRoot 'uupdump-package.zip'
+
+          if (Test-Path -LiteralPath $workRoot) {
+            Remove-Item -LiteralPath $workRoot -Recurse -Force
+          }
+
+          $null = New-Item -ItemType Directory -Path $packageRoot -Force
+          $null = New-Item -ItemType Directory -Path $outputRoot -Force
+
+          $packageUrl = 'https://uupdump.net/get.php?id={0}&pack={1}&edition={2}' -f `
+            [uri]::EscapeDataString($env:UPDATE_ID), `
+            [uri]::EscapeDataString($env:LANGUAGE), `
+            [uri]::EscapeDataString($env:EDITION.ToLowerInvariant())
+
+          $requestBody = @{
+            autodl  = '2'
+            updates = '1'
+            cleanup = '1'
+            netfx   = '1'
+            esd     = '1'
+          }
+
+          Invoke-WebRequest `
+            -Uri $packageUrl `
+            -Method Post `
+            -Body $requestBody `
+            -Headers @{ 'User-Agent' = 'UUP-AutoBuild/1.0' } `
+            -OutFile $packageZip
+
+          $zipHeader = [System.IO.File]::ReadAllBytes($packageZip)
+          if ($zipHeader.Length -lt 2 -or $zipHeader[0] -ne 0x50 -or $zipHeader[1] -ne 0x4B) {
+            throw 'UUP dump did not return a valid zip package.'
+          }
+
+          Expand-Archive -LiteralPath $packageZip -DestinationPath $packageRoot -Force
+
+          $convertConfigPath = Join-Path $packageRoot 'ConvertConfig.ini'
+          if (Test-Path -LiteralPath $convertConfigPath) {
+            $convertConfig = Get-Content -LiteralPath $convertConfigPath -Raw
+            $convertConfig = $convertConfig.Replace('AutoExit     =0', 'AutoExit     =1')
+            Set-Content -LiteralPath $convertConfigPath -Value $convertConfig -Encoding ASCII
+          }
+
+          $downloadScript = Join-Path $packageRoot 'uup_download_windows.cmd'
+          if (-not (Test-Path -LiteralPath $downloadScript -PathType Leaf)) {
+            throw 'Official UUP dump package does not contain uup_download_windows.cmd'
+          }
+
+          Push-Location -LiteralPath $packageRoot
+          try {
+            cmd.exe /d /c """$downloadScript"" 49127c4b-02dc-482e-ac4f-ec4d659b7547"
+            if ($LASTEXITCODE -ne 0) {
+              throw "uup_download_windows.cmd failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            Pop-Location
+          }
+
+          $isoFile = Get-ChildItem -LiteralPath $packageRoot -Filter *.iso -File -Recurse |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+
+          if ($null -eq $isoFile) {
+            throw 'No ISO file was generated by the official UUP dump script.'
+          }
+
+          $artifactBaseName = ('Windows_{0}_{1}_{2}_{3}_{4}' -f `
+            $env:FOUND_BUILD, `
+            $env:CHANNEL, `
+            $env:ARCH, `
+            $env:LANGUAGE, `
+            $env:EDITION).Replace(' ', '_') -replace '[^0-9A-Za-z._-]', '-'
+          $finalIsoPath = Join-Path $outputRoot "$artifactBaseName.iso"
+          $releaseNotesPath = Join-Path $outputRoot "$artifactBaseName.txt"
+
+          Copy-Item -LiteralPath $isoFile.FullName -Destination $finalIsoPath -Force
+
+          @(
+            "Channel: $env:CHANNEL"
+            "Build: $env:FOUND_BUILD"
+            "Title: $env:UPDATE_TITLE"
+            "Architecture: $env:ARCH"
+            "Language: $env:LANGUAGE"
+            "Edition: $env:EDITION"
+            "UUP Update ID: $env:UPDATE_ID"
+            'Conversion: official UUP dump package'
+            'Options: updates + cleanup + .NET Framework 3.5 + ESD'
+          ) | Set-Content -LiteralPath $releaseNotesPath -Encoding UTF8
+
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "iso_path=$finalIsoPath"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "artifact_name=$artifactBaseName"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "release_notes_path=$releaseNotesPath"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "release_title=Windows $env:FOUND_BUILD $env:CHANNEL $env:ARCH $env:LANGUAGE $env:EDITION"
+
+      - name: Upload ISO Artifact
+        uses: actions/upload-artifact@main
+        with:
+          name: ${{ steps.build.outputs.artifact_name }}
+          path: ${{ steps.build.outputs.iso_path }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $isoPath = "${{ steps.build.outputs.iso_path }}"
+          $releaseNotesPath = "${{ steps.build.outputs.release_notes_path }}"
+          $releaseTitle = "${{ steps.build.outputs.release_title }}"
+
+          gh release view $env:TAG_NAME --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG_NAME $isoPath --clobber --repo $env:GITHUB_REPOSITORY
+            gh release edit $env:TAG_NAME --title $releaseTitle --notes-file $releaseNotesPath --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $env:TAG_NAME $isoPath --title $releaseTitle --notes-file $releaseNotesPath --repo $env:GITHUB_REPOSITORY
+          }
+
+  Finalize:
+    name: Finalize Workflow
+    needs: Build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 0

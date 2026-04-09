@@ -1,0 +1,6 @@
+dist/
+work/
+*.iso
+*.wim
+*.esd
+aria2_download.log
