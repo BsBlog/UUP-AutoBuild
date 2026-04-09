@@ -44,7 +44,6 @@ jobs:
 
       - name: Build Matrix
         id: prepare
-        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -193,11 +192,9 @@ jobs:
         uses: actions/checkout@main
 
       # - name: Disk Space Before Cleanup
-      #   shell: pwsh
       #   run: Get-PSDrive -PSProvider FileSystem | Sort-Object Name | Format-Table -Auto
 
       # - name: Free Disk Space
-      #   shell: pwsh
       #   run: |
       #     $paths = @(
       #       'C:\Program Files\Android',
@@ -219,7 +216,6 @@ jobs:
 
       - name: Download Official Package And Build ISO
         id: build
-        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -330,7 +326,6 @@ jobs:
           compression-level: 0
 
       - name: Publish GitHub Release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
