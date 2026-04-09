@@ -93,7 +93,7 @@ jobs:
               Select-Object -Unique
           }
 
-          $include = New-Object System.Collections.Generic.List[object]
+          $include = [System.Collections.ArrayList]::new()
 
           foreach ($channel in $channels) {
             if (-not $channelMap.ContainsKey($channel)) {
@@ -136,7 +136,7 @@ jobs:
                     continue
                   }
 
-                  $include.Add([ordered]@{
+                  [void]$include.Add([pscustomobject]@{
                     channel      = $channel
                     ring         = $ring
                     flight       = $flight
@@ -159,7 +159,10 @@ jobs:
             }
           }
 
-          $matrix = @{ include = @($include) } | ConvertTo-Json -Compress -Depth 20
+          $matrixObject = [pscustomobject]@{
+            include = @($include)
+          }
+          $matrix = $matrixObject | ConvertTo-Json -Compress -Depth 20
 
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "matrix=$matrix"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "build_count=$($include.Count)"
