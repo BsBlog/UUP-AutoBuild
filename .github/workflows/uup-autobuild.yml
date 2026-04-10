@@ -32,12 +32,13 @@ on:
     - cron: "0 3 * * *"
 
 jobs:
-  prepare:
+  Prepare:
     name: Prepare Latest Builds
     runs-on: windows-latest
     outputs:
       matrix: ${{ steps.prepare.outputs.matrix }}
       build_count: ${{ steps.prepare.outputs.build_count }}
+      first_tag_name: ${{ steps.prepare.outputs.first_tag_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@main
@@ -165,17 +166,19 @@ jobs:
 
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "matrix=$matrix"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "build_count=$($include.Count)"
+          $firstTagName = if ($include.Count -gt 0) { $include[0].tag_name } else { '' }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "first_tag_name=$firstTagName"
 
           Write-Host "Preparation completed. Build count: $($include.Count)"
 
   Build:
     name: Build ${{ matrix.channel }} ${{ matrix.arch }} ${{ matrix.language }}
-    needs: prepare
-    if: ${{ needs.prepare.outputs.build_count != '0' }}
+    needs: Prepare
+    if: ${{ needs.Prepare.outputs.build_count != '0' }}
     runs-on: windows-latest
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.Prepare.outputs.matrix) }}
     env:
       CHANNEL: ${{ matrix.channel }}
       UPDATE_ID: ${{ matrix.update_id }}
@@ -191,29 +194,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@main
-
-      # - name: Disk Space Before Cleanup
-      #   run: Get-PSDrive -PSProvider FileSystem | Sort-Object Name | Format-Table -Auto
-
-      # - name: Free Disk Space
-      #   run: |
-      #     $paths = @(
-      #       'C:\Program Files\Android',
-      #       'C:\Program Files (x86)\Android',
-      #       'C:\hostedtoolcache\windows\Python',
-      #       'C:\hostedtoolcache\windows\Ruby',
-      #       'C:\hostedtoolcache\windows\Go',
-      #       'C:\hostedtoolcache\windows\CodeQL'
-      #     )
-
-      #     foreach ($path in $paths) {
-      #       if (Test-Path -LiteralPath $path) {
-      #         Write-Host "Removing $path"
-      #         Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
-      #       }
-      #     }
-
-      #     Get-PSDrive -PSProvider FileSystem | Sort-Object Name | Format-Table -Auto
 
       - name: Download Official Package And Build ISO
         id: build
@@ -297,82 +277,41 @@ jobs:
             $env:LANGUAGE, `
             $env:EDITION).Replace(' ', '_') -replace '[^0-9A-Za-z._-]', '-'
           $finalIsoPath = Join-Path $outputRoot "$artifactBaseName.iso"
-          $releaseNotesPath = Join-Path $outputRoot "$artifactBaseName.txt"
 
           Copy-Item -LiteralPath $isoFile.FullName -Destination $finalIsoPath -Force
 
-          @(
-            "Channel: $env:CHANNEL"
-            "Build: $env:FOUND_BUILD"
-            "Title: $env:UPDATE_TITLE"
-            "Architecture: $env:ARCH"
-            "Language: $env:LANGUAGE"
-            "Edition: $env:EDITION"
-            "UUP Update ID: $env:UPDATE_ID"
-            'Conversion: official UUP dump package'
-            'Options: updates + cleanup + .NET Framework 3.5 + ESD'
-          ) | Set-Content -LiteralPath $releaseNotesPath -Encoding UTF8
-
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "iso_path=$finalIsoPath"
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "artifact_name=$artifactBaseName"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "release_notes_path=$releaseNotesPath"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "release_title=Windows $env:FOUND_BUILD $env:CHANNEL $env:ARCH $env:LANGUAGE $env:EDITION"
 
       - name: Upload ISO Artifact
         uses: actions/upload-artifact@main
         with:
-          name: ${{ steps.build.outputs.artifact_name }}
+          name: iso-${{ matrix.tag_name }}
           path: ${{ steps.build.outputs.iso_path }}
           if-no-files-found: error
           compression-level: 0
 
-      - name: Prepare Release Assets
-        id: release_assets
+  Release:
+    name: Release
+    needs:
+      - Prepare
+      - Build
+    if: ${{ always() && needs.Prepare.outputs.build_count != '0' && needs.Build.result != 'cancelled' }}
+    runs-on: windows-latest
+    steps:
+      - name: Prepare, Cleanup, And Publish Releases
         env:
           GH_TOKEN: ${{ github.token }}
+          MATRIX_JSON: ${{ needs.Prepare.outputs.matrix }}
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $isoPath = "${{ steps.build.outputs.iso_path }}"
-          $releaseNotesPath = "${{ steps.build.outputs.release_notes_path }}"
-          $releaseTitle = "${{ steps.build.outputs.release_title }}"
-          $outputRoot = Split-Path -Path $isoPath -Parent
-          $workRoot = Split-Path -Path $outputRoot -Parent
-          $packageRoot = Join-Path $workRoot 'package'
-          $releaseAssetDir = Join-Path $outputRoot 'release-assets'
-          $releaseAssetSummary = 'ISO'
-
-          if (Test-Path -LiteralPath $releaseAssetDir) {
-            Remove-Item -LiteralPath $releaseAssetDir -Recurse -Force
+          $matrix = $env:MATRIX_JSON | ConvertFrom-Json -Depth 20
+          if ($null -eq $matrix -or $null -eq $matrix.include -or $matrix.include.Count -eq 0) {
+            Write-Host 'No matrix items to release.'
+            exit 0
           }
-          $null = New-Item -ItemType Directory -Path $releaseAssetDir -Force
-
-          $isoItem = Get-Item -LiteralPath $isoPath
-          $releaseAssetSizeLimitBytes = 1900MB
-          if ($isoItem.Length -gt $releaseAssetSizeLimitBytes) {
-            $sevenZipPath = Join-Path $packageRoot 'files\7zr.exe'
-            if (-not (Test-Path -LiteralPath $sevenZipPath -PathType Leaf)) {
-              throw '7zr.exe was not found. Cannot create split ZIP release archives.'
-            }
-
-            $splitArchiveBase = Join-Path $releaseAssetDir ("{0}.zip" -f [System.IO.Path]::GetFileNameWithoutExtension($isoPath))
-            & $sevenZipPath a '-tzip' '-mx=1' '-v1900m' $splitArchiveBase $isoPath
-            if ($LASTEXITCODE -ne 0) {
-              throw "7zr.exe failed with exit code $LASTEXITCODE"
-            }
-
-            $releaseAssetSummary = 'Split ZIP volumes (1.9 GB each)'
-          } else {
-            Copy-Item -LiteralPath $isoPath -Destination (Join-Path $releaseAssetDir (Split-Path -Path $isoPath -Leaf)) -Force
-          }
-
-          $releaseAssets = Get-ChildItem -LiteralPath $releaseAssetDir -File | Sort-Object Name
-          if ($releaseAssets.Count -eq 0) {
-            throw 'No release assets were produced.'
-          }
-
-          $releaseBody = (Get-Content -LiteralPath $releaseNotesPath -Raw).TrimEnd()
-          $releaseBody = $releaseBody + [Environment]::NewLine + "Release Asset Format: $releaseAssetSummary"
 
           $releaseTags = @(gh release list --repo $env:GITHUB_REPOSITORY --limit 1000 --json tagName --jq '.[].tagName')
           $releaseTags = @($releaseTags | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -382,25 +321,125 @@ jobs:
             gh release delete $releaseTag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
           }
 
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "asset_glob=$releaseAssetDir\\*"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "release_body<<__BODY__"
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value $releaseBody
-          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "__BODY__"
+          foreach ($entry in $matrix.include) {
+            $tagName = [string]$entry.tag_name
+            $artifactName = "iso-$tagName"
+            $entryRoot = Join-Path $env:RUNNER_TEMP $tagName
+            $artifactDir = Join-Path $entryRoot 'artifact'
+            $releaseAssetDir = Join-Path $entryRoot 'release-assets'
 
-      - name: Publish GitHub Release
-        uses: svenstaro/upload-release-action@master
-        with:
-          repo_token: ${{ github.token }}
-          file: ${{ steps.release_assets.outputs.asset_glob }}
-          file_glob: true
-          tag: ${{ env.TAG_NAME }}
-          overwrite: true
-          release_name: ${{ steps.build.outputs.release_title }}
-          body: ${{ steps.release_assets.outputs.release_body }}
+            if (Test-Path -LiteralPath $entryRoot) {
+              Remove-Item -LiteralPath $entryRoot -Recurse -Force
+            }
+            $null = New-Item -ItemType Directory -Path $artifactDir -Force
+            $null = New-Item -ItemType Directory -Path $releaseAssetDir -Force
 
-  finalize:
+            & gh run download $env:GITHUB_RUN_ID --repo $env:GITHUB_REPOSITORY --name $artifactName --dir $artifactDir
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Artifact $artifactName was not found. Skipping $tagName."
+              continue
+            }
+
+            $isoPath = Get-ChildItem -LiteralPath $artifactDir -Filter *.iso -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            if ([string]::IsNullOrWhiteSpace($isoPath)) {
+              Write-Warning "No ISO was found inside artifact $artifactName. Skipping $tagName."
+              Remove-Item -LiteralPath $entryRoot -Recurse -Force
+              continue
+            }
+
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+            $zipPath = Join-Path $releaseAssetDir ("{0}.zip" -f [System.IO.Path]::GetFileNameWithoutExtension($isoPath))
+            $zipFileStream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            try {
+              $zipArchive = [System.IO.Compression.ZipArchive]::new($zipFileStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+              try {
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                  $zipArchive,
+                  $isoPath,
+                  [System.IO.Path]::GetFileName($isoPath),
+                  [System.IO.Compression.CompressionLevel]::NoCompression
+                ) | Out-Null
+              } finally {
+                $zipArchive.Dispose()
+              }
+            } finally {
+              $zipFileStream.Dispose()
+            }
+
+            $releaseAssetSummary = 'ZIP'
+            $zipItem = Get-Item -LiteralPath $zipPath
+            $releaseAssetSizeLimitBytes = 1900MB
+            if ($zipItem.Length -gt $releaseAssetSizeLimitBytes) {
+              $bufferSize = 4MB
+              $buffer = New-Object byte[] $bufferSize
+              $partIndex = 1
+
+              $inputStream = [System.IO.File]::OpenRead($zipPath)
+              try {
+                while ($inputStream.Position -lt $inputStream.Length) {
+                  $partPath = "{0}.{1:D3}" -f $zipPath, $partIndex
+                  $outputStream = [System.IO.File]::Open($partPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                  try {
+                    $remainingInPart = [int64]$releaseAssetSizeLimitBytes
+                    while ($remainingInPart -gt 0 -and $inputStream.Position -lt $inputStream.Length) {
+                      $remainingFileBytes = $inputStream.Length - $inputStream.Position
+                      $bytesToRead = [Math]::Min([int64]$buffer.Length, [Math]::Min($remainingInPart, $remainingFileBytes))
+                      $read = $inputStream.Read($buffer, 0, [int]$bytesToRead)
+                      if ($read -le 0) {
+                        break
+                      }
+
+                      $outputStream.Write($buffer, 0, $read)
+                      $remainingInPart -= $read
+                    }
+                  } finally {
+                    $outputStream.Dispose()
+                  }
+
+                  $partIndex++
+                }
+              } finally {
+                $inputStream.Dispose()
+              }
+
+              Remove-Item -LiteralPath $zipPath -Force
+              $releaseAssetSummary = 'Split ZIP parts (1.9 GB each, reassemble before extracting)'
+            }
+
+            $releaseAssets = Get-ChildItem -LiteralPath $releaseAssetDir -File | Sort-Object Name
+            if ($releaseAssets.Count -eq 0) {
+              throw "No release assets were produced for $tagName."
+            }
+
+            $releaseNotesPath = Join-Path $releaseAssetDir 'release-notes.txt'
+            @(
+              "Channel: $($entry.channel)"
+              "Build: $($entry.found_build)"
+              "Title: $($entry.update_title)"
+              "Architecture: $($entry.arch)"
+              "Language: $($entry.language)"
+              "Edition: $($entry.edition)"
+              "UUP Update ID: $($entry.update_id)"
+              'Conversion: official UUP dump package'
+              'Options: updates + cleanup + .NET Framework 3.5 + ESD'
+              "Release Asset Format: $releaseAssetSummary"
+            ) | Set-Content -LiteralPath $releaseNotesPath -Encoding UTF8
+
+            $releaseTitle = "Windows $($entry.found_build) $($entry.channel) $($entry.arch) $($entry.language) $($entry.edition)"
+            $assetPaths = @($releaseAssets | ForEach-Object { $_.FullName })
+
+            gh release create $tagName @assetPaths `
+              --repo $env:GITHUB_REPOSITORY `
+              --title $releaseTitle `
+              --notes-file $releaseNotesPath
+
+            Remove-Item -LiteralPath $entryRoot -Recurse -Force
+          }
+
+  Finalize:
     name: Finalize Workflow
-    needs: Build
+    needs: Release
     runs-on: ubuntu-latest
     if: always()
     steps:
