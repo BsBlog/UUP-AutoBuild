@@ -303,7 +303,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MATRIX_JSON: ${{ needs.Prepare.outputs.matrix }}
-        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
