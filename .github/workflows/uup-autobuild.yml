@@ -52,7 +52,7 @@ jobs:
           $languageInput = "${{ github.event.inputs.languages || '' }}"
           $archInput = "${{ github.event.inputs.arch || '' }}"
           $searchInput = "${{ github.event.inputs.search_term || '' }}"
-          $forceBuild = "${{ github.event.inputs.force_build || 'true' }}" -eq 'false'
+          $forceBuild = "${{ github.event_name == 'schedule' || inputs.force_build }}" -eq 'true'
 
           $defaultChannels = @('RETAIL', 'WIF', 'WIS', 'CANARY')
           $defaultLanguages = @('zh-cn', 'en-us')
