@@ -52,7 +52,7 @@ jobs:
           $languageInput = "${{ github.event.inputs.languages || '' }}"
           $archInput = "${{ github.event.inputs.arch || '' }}"
           $searchInput = "${{ github.event.inputs.search_term || '' }}"
-          $forceBuild = "${{ github.event.inputs.force_build || 'false' }}" -eq 'true'
+          $forceBuild = "${{ github.event.inputs.force_build || 'true' }}" -eq 'false'
 
           $defaultChannels = @('RETAIL', 'WIF', 'WIS', 'CANARY')
           $defaultLanguages = @('zh-cn', 'en-us')
@@ -291,150 +291,171 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-  Release:
-    name: Release
+  DeleteOldReleases:
+    name: Delete Old Releases
     needs:
       - Prepare
       - Build
     if: ${{ always() && needs.Prepare.outputs.build_count != '0' && needs.Build.result != 'cancelled' }}
     runs-on: windows-latest
     steps:
-      - name: Prepare, Cleanup, And Publish Releases
+      - name: Delete Existing Releases
         env:
           GH_TOKEN: ${{ github.token }}
-          MATRIX_JSON: ${{ needs.Prepare.outputs.matrix }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $matrix = $env:MATRIX_JSON | ConvertFrom-Json -Depth 20
-          if ($null -eq $matrix -or $null -eq $matrix.include -or $matrix.include.Count -eq 0) {
-            Write-Host 'No matrix items to release.'
-            exit 0
-          }
-
           $releaseTags = @(gh release list --repo $env:GITHUB_REPOSITORY --limit 1000 --json tagName --jq '.[].tagName')
           $releaseTags = @($releaseTags | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+          if ($releaseTags.Count -eq 0) {
+            Write-Host 'No existing releases to delete.'
+            exit 0
+          }
 
           foreach ($releaseTag in $releaseTags) {
             Write-Host "Deleting release $releaseTag"
             gh release delete $releaseTag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
           }
 
-          foreach ($entry in $matrix.include) {
-            $tagName = [string]$entry.tag_name
-            $artifactName = "iso-$tagName"
-            $entryRoot = Join-Path $env:RUNNER_TEMP $tagName
-            $artifactDir = Join-Path $entryRoot 'artifact'
-            $releaseAssetDir = Join-Path $entryRoot 'release-assets'
+  Release:
+    name: Release ${{ matrix.tag_name }}
+    needs:
+      - Prepare
+      - Build
+      - DeleteOldReleases
+    if: ${{ always() && needs.Prepare.outputs.build_count != '0' && needs.Build.result != 'cancelled' && needs.DeleteOldReleases.result == 'success' }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.Prepare.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CHANNEL: ${{ matrix.channel }}
+      UPDATE_ID: ${{ matrix.update_id }}
+      UPDATE_TITLE: ${{ matrix.update_title }}
+      FOUND_BUILD: ${{ matrix.found_build }}
+      ARCH: ${{ matrix.arch }}
+      LANGUAGE: ${{ matrix.language }}
+      EDITION: ${{ matrix.edition }}
+      TAG_NAME: ${{ matrix.tag_name }}
+    steps:
+      - name: Package And Publish Release
+        run: |
+          $ErrorActionPreference = 'Stop'
 
-            if (Test-Path -LiteralPath $entryRoot) {
-              Remove-Item -LiteralPath $entryRoot -Recurse -Force
-            }
-            $null = New-Item -ItemType Directory -Path $artifactDir -Force
-            $null = New-Item -ItemType Directory -Path $releaseAssetDir -Force
+          $artifactName = "iso-$env:TAG_NAME"
+          $entryRoot = Join-Path $env:RUNNER_TEMP $env:TAG_NAME
+          $artifactDir = Join-Path $entryRoot 'artifact'
+          $releaseAssetDir = Join-Path $entryRoot 'release-assets'
 
-            & gh run download $env:GITHUB_RUN_ID --repo $env:GITHUB_REPOSITORY --name $artifactName --dir $artifactDir
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Artifact $artifactName was not found. Skipping $tagName."
-              continue
-            }
-
-            $isoPath = Get-ChildItem -LiteralPath $artifactDir -Filter *.iso -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-            if ([string]::IsNullOrWhiteSpace($isoPath)) {
-              Write-Warning "No ISO was found inside artifact $artifactName. Skipping $tagName."
-              Remove-Item -LiteralPath $entryRoot -Recurse -Force
-              continue
-            }
-
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-            $zipPath = Join-Path $releaseAssetDir ("{0}.zip" -f [System.IO.Path]::GetFileNameWithoutExtension($isoPath))
-            $zipFileStream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-            try {
-              $zipArchive = [System.IO.Compression.ZipArchive]::new($zipFileStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
-              try {
-                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                  $zipArchive,
-                  $isoPath,
-                  [System.IO.Path]::GetFileName($isoPath),
-                  [System.IO.Compression.CompressionLevel]::NoCompression
-                ) | Out-Null
-              } finally {
-                $zipArchive.Dispose()
-              }
-            } finally {
-              $zipFileStream.Dispose()
-            }
-
-            $releaseAssetSummary = 'ZIP'
-            $zipItem = Get-Item -LiteralPath $zipPath
-            $releaseAssetSizeLimitBytes = 1900MB
-            if ($zipItem.Length -gt $releaseAssetSizeLimitBytes) {
-              $bufferSize = 4MB
-              $buffer = New-Object byte[] $bufferSize
-              $partIndex = 1
-
-              $inputStream = [System.IO.File]::OpenRead($zipPath)
-              try {
-                while ($inputStream.Position -lt $inputStream.Length) {
-                  $partPath = "{0}.{1:D3}" -f $zipPath, $partIndex
-                  $outputStream = [System.IO.File]::Open($partPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-                  try {
-                    $remainingInPart = [int64]$releaseAssetSizeLimitBytes
-                    while ($remainingInPart -gt 0 -and $inputStream.Position -lt $inputStream.Length) {
-                      $remainingFileBytes = $inputStream.Length - $inputStream.Position
-                      $bytesToRead = [Math]::Min([int64]$buffer.Length, [Math]::Min($remainingInPart, $remainingFileBytes))
-                      $read = $inputStream.Read($buffer, 0, [int]$bytesToRead)
-                      if ($read -le 0) {
-                        break
-                      }
-
-                      $outputStream.Write($buffer, 0, $read)
-                      $remainingInPart -= $read
-                    }
-                  } finally {
-                    $outputStream.Dispose()
-                  }
-
-                  $partIndex++
-                }
-              } finally {
-                $inputStream.Dispose()
-              }
-
-              Remove-Item -LiteralPath $zipPath -Force
-              $releaseAssetSummary = 'Split ZIP parts (1.9 GB each, reassemble before extracting)'
-            }
-
-            $releaseAssets = Get-ChildItem -LiteralPath $releaseAssetDir -File | Sort-Object Name
-            if ($releaseAssets.Count -eq 0) {
-              throw "No release assets were produced for $tagName."
-            }
-
-            $releaseNotesPath = Join-Path $releaseAssetDir 'release-notes.txt'
-            @(
-              "Channel: $($entry.channel)"
-              "Build: $($entry.found_build)"
-              "Title: $($entry.update_title)"
-              "Architecture: $($entry.arch)"
-              "Language: $($entry.language)"
-              "Edition: $($entry.edition)"
-              "UUP Update ID: $($entry.update_id)"
-              'Conversion: official UUP dump package'
-              'Options: updates + cleanup + .NET Framework 3.5 + ESD'
-              "Release Asset Format: $releaseAssetSummary"
-            ) | Set-Content -LiteralPath $releaseNotesPath -Encoding UTF8
-
-            $releaseTitle = "Windows $($entry.found_build) $($entry.channel) $($entry.arch) $($entry.language) $($entry.edition)"
-            $assetPaths = @($releaseAssets | ForEach-Object { $_.FullName })
-
-            gh release create $tagName @assetPaths `
-              --repo $env:GITHUB_REPOSITORY `
-              --title $releaseTitle `
-              --notes-file $releaseNotesPath
-
+          if (Test-Path -LiteralPath $entryRoot) {
             Remove-Item -LiteralPath $entryRoot -Recurse -Force
           }
+          $null = New-Item -ItemType Directory -Path $artifactDir -Force
+          $null = New-Item -ItemType Directory -Path $releaseAssetDir -Force
+
+          & gh run download $env:GITHUB_RUN_ID --repo $env:GITHUB_REPOSITORY --name $artifactName --dir $artifactDir
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Artifact $artifactName was not found. Skipping $env:TAG_NAME."
+            exit 0
+          }
+
+          $isoPath = Get-ChildItem -LiteralPath $artifactDir -Filter *.iso -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if ([string]::IsNullOrWhiteSpace($isoPath)) {
+            Write-Warning "No ISO was found inside artifact $artifactName. Skipping $env:TAG_NAME."
+            Remove-Item -LiteralPath $entryRoot -Recurse -Force
+            exit 0
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $zipPath = Join-Path $releaseAssetDir ("{0}.zip" -f [System.IO.Path]::GetFileNameWithoutExtension($isoPath))
+          $zipFileStream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+          try {
+            $zipArchive = [System.IO.Compression.ZipArchive]::new($zipFileStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+            try {
+              [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $zipArchive,
+                $isoPath,
+                [System.IO.Path]::GetFileName($isoPath),
+                [System.IO.Compression.CompressionLevel]::NoCompression
+              ) | Out-Null
+            } finally {
+              $zipArchive.Dispose()
+            }
+          } finally {
+            $zipFileStream.Dispose()
+          }
+
+          $releaseAssetSummary = 'ZIP'
+          $zipItem = Get-Item -LiteralPath $zipPath
+          $releaseAssetSizeLimitBytes = 1900MB
+          if ($zipItem.Length -gt $releaseAssetSizeLimitBytes) {
+            $bufferSize = 4MB
+            $buffer = New-Object byte[] $bufferSize
+            $partIndex = 1
+
+            $inputStream = [System.IO.File]::OpenRead($zipPath)
+            try {
+              while ($inputStream.Position -lt $inputStream.Length) {
+                $partPath = "{0}.{1:D3}" -f $zipPath, $partIndex
+                $outputStream = [System.IO.File]::Open($partPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                try {
+                  $remainingInPart = [int64]$releaseAssetSizeLimitBytes
+                  while ($remainingInPart -gt 0 -and $inputStream.Position -lt $inputStream.Length) {
+                    $remainingFileBytes = $inputStream.Length - $inputStream.Position
+                    $bytesToRead = [Math]::Min([int64]$buffer.Length, [Math]::Min($remainingInPart, $remainingFileBytes))
+                    $read = $inputStream.Read($buffer, 0, [int]$bytesToRead)
+                    if ($read -le 0) {
+                      break
+                    }
+
+                    $outputStream.Write($buffer, 0, $read)
+                    $remainingInPart -= $read
+                  }
+                } finally {
+                  $outputStream.Dispose()
+                }
+
+                $partIndex++
+              }
+            } finally {
+              $inputStream.Dispose()
+            }
+
+            Remove-Item -LiteralPath $zipPath -Force
+            $releaseAssetSummary = 'Split ZIP parts (1.9 GB each, reassemble before extracting)'
+          }
+
+          $releaseAssets = Get-ChildItem -LiteralPath $releaseAssetDir -File | Sort-Object Name
+          if ($releaseAssets.Count -eq 0) {
+            throw "No release assets were produced for $env:TAG_NAME."
+          }
+
+          $releaseNotesPath = Join-Path $releaseAssetDir 'release-notes.txt'
+          @(
+            "Channel: $env:CHANNEL"
+            "Build: $env:FOUND_BUILD"
+            "Title: $env:UPDATE_TITLE"
+            "Architecture: $env:ARCH"
+            "Language: $env:LANGUAGE"
+            "Edition: $env:EDITION"
+            "UUP Update ID: $env:UPDATE_ID"
+            'Conversion: official UUP dump package'
+            'Options: updates + cleanup + .NET Framework 3.5 + ESD'
+            "Release Asset Format: $releaseAssetSummary"
+          ) | Set-Content -LiteralPath $releaseNotesPath -Encoding UTF8
+
+          $releaseTitle = "Windows $env:FOUND_BUILD $env:CHANNEL $env:ARCH $env:LANGUAGE $env:EDITION"
+          $assetPaths = @($releaseAssets | ForEach-Object { $_.FullName })
+
+          gh release create $env:TAG_NAME @assetPaths `
+            --repo $env:GITHUB_REPOSITORY `
+            --title $releaseTitle `
+            --notes-file $releaseNotesPath
+
+          Remove-Item -LiteralPath $entryRoot -Recurse -Force
 
   Finalize:
     name: Finalize Workflow
