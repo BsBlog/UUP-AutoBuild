@@ -1,6 +1,11 @@
 # UUP AutoBuild
 
-This repository provides a GitHub Actions workflow that automatically finds the latest Windows builds on UUP dump, downloads the official UUP dump conversion package, and runs the bundled `uup_download_windows.cmd` script to generate ISO images.
+This repository provides a GitHub Actions workflow that automatically finds the latest Windows builds on [UUP dump](https://uupdump.net), downloads the official UUP dump conversion package, and runs the bundled `uup_download_windows.cmd` script to generate ISO images.
+
+> [!IMPORTANT]
+> Installation images created using the scripts provided by UUP dump are meant only for evaluation purposes.
+> The images and their deployments are not supported in any way by Microsoft Corporation.
+> The authors are not liable for any damages caused by a misuse of the website.
 
 ## Default Behavior
 
