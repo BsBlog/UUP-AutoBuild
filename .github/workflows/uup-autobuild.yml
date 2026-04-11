@@ -330,7 +330,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.Prepare.outputs.matrix) }}
     env:
-      GH_TOKEN: ${{ github.token }}
       CHANNEL: ${{ matrix.channel }}
       UPDATE_ID: ${{ matrix.update_id }}
       UPDATE_TITLE: ${{ matrix.update_title }}
@@ -340,11 +339,11 @@ jobs:
       EDITION: ${{ matrix.edition }}
       TAG_NAME: ${{ matrix.tag_name }}
     steps:
-      - name: Package And Publish Release
+      - name: Prepare Release Workspace
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $artifactName = "iso-$env:TAG_NAME"
           $entryRoot = Join-Path $env:RUNNER_TEMP $env:TAG_NAME
           $artifactDir = Join-Path $entryRoot 'artifact'
           $releaseAssetDir = Join-Path $entryRoot 'release-assets'
@@ -352,41 +351,140 @@ jobs:
           if (Test-Path -LiteralPath $entryRoot) {
             Remove-Item -LiteralPath $entryRoot -Recurse -Force
           }
+
           $null = New-Item -ItemType Directory -Path $artifactDir -Force
           $null = New-Item -ItemType Directory -Path $releaseAssetDir -Force
 
-          & gh run download $env:GITHUB_RUN_ID --repo $env:GITHUB_REPOSITORY --name $artifactName --dir $artifactDir
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Artifact $artifactName was not found. Skipping $env:TAG_NAME."
-            exit 0
+      - name: Download ISO Artifact
+        id: download_artifact
+        continue-on-error: true
+        uses: actions/download-artifact@main
+        with:
+          name: iso-${{ matrix.tag_name }}
+          path: ${{ runner.temp }}/${{ matrix.tag_name }}/artifact
+
+      - name: Package Release Assets
+        id: package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Write-Log {
+            param([string]$Message)
+
+            Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Message)
           }
+
+          function Format-Size {
+            param([int64]$Bytes)
+
+            $units = @('B', 'KB', 'MB', 'GB', 'TB')
+            $value = [double]$Bytes
+            $unitIndex = 0
+
+            while ($value -ge 1024 -and $unitIndex -lt ($units.Length - 1)) {
+              $value /= 1024
+              $unitIndex++
+            }
+
+            if ($unitIndex -eq 0) {
+              return '{0} {1}' -f [int64]$value, $units[$unitIndex]
+            }
+
+            return '{0:N2} {1}' -f $value, $units[$unitIndex]
+          }
+
+          function Copy-StreamWithProgress {
+            param(
+              [Parameter(Mandatory = $true)]
+              [System.IO.Stream]$InputStream,
+
+              [Parameter(Mandatory = $true)]
+              [System.IO.Stream]$OutputStream,
+
+              [Parameter(Mandatory = $true)]
+              [int64]$TotalBytes,
+
+              [Parameter(Mandatory = $true)]
+              [string]$Activity,
+
+              [int]$HeartbeatSeconds = 15,
+              [int]$BufferSize = 16777216
+            )
+
+            $buffer = New-Object byte[] $BufferSize
+            $bytesProcessed = [int64]0
+            $nextPercent = 10
+            $lastReport = Get-Date
+
+            while (($read = $InputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+              $OutputStream.Write($buffer, 0, $read)
+              $bytesProcessed += $read
+
+              $percent = if ($TotalBytes -gt 0) {
+                [Math]::Min(100, [int](($bytesProcessed * 100) / $TotalBytes))
+              } else {
+                100
+              }
+
+              $now = Get-Date
+              if ($percent -ge $nextPercent -or ($now - $lastReport).TotalSeconds -ge $HeartbeatSeconds) {
+                Write-Log ("{0}: {1}% ({2} / {3})" -f $Activity, $percent, (Format-Size $bytesProcessed), (Format-Size $TotalBytes))
+                while ($nextPercent -le $percent) {
+                  $nextPercent += 10
+                }
+                $lastReport = $now
+              }
+            }
+
+            Write-Log ("{0}: 100% ({1} / {2})" -f $Activity, (Format-Size $bytesProcessed), (Format-Size $TotalBytes))
+          }
+
+          $entryRoot = Join-Path $env:RUNNER_TEMP $env:TAG_NAME
+          $artifactDir = Join-Path $entryRoot 'artifact'
+          $releaseAssetDir = Join-Path $entryRoot 'release-assets'
 
           $isoPath = Get-ChildItem -LiteralPath $artifactDir -Filter *.iso -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
           if ([string]::IsNullOrWhiteSpace($isoPath)) {
-            Write-Warning "No ISO was found inside artifact $artifactName. Skipping $env:TAG_NAME."
-            Remove-Item -LiteralPath $entryRoot -Recurse -Force
+            Write-Warning "No ISO was found inside artifact iso-$env:TAG_NAME. Skipping $env:TAG_NAME."
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'skip_release=true'
             exit 0
           }
 
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'skip_release=false'
+
           Add-Type -AssemblyName System.IO.Compression.FileSystem
 
+          $isoItem = Get-Item -LiteralPath $isoPath
           $zipPath = Join-Path $releaseAssetDir ("{0}.zip" -f [System.IO.Path]::GetFileNameWithoutExtension($isoPath))
+          Write-Log ("Creating ZIP package from {0} ({1})" -f $isoItem.Name, (Format-Size $isoItem.Length))
           $zipFileStream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
           try {
             $zipArchive = [System.IO.Compression.ZipArchive]::new($zipFileStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
             try {
-              [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                $zipArchive,
-                $isoPath,
+              $zipEntry = $zipArchive.CreateEntry(
                 [System.IO.Path]::GetFileName($isoPath),
                 [System.IO.Compression.CompressionLevel]::NoCompression
-              ) | Out-Null
+              )
+              $isoStream = [System.IO.File]::OpenRead($isoPath)
+              $entryStream = $zipEntry.Open()
+              try {
+                Copy-StreamWithProgress `
+                  -InputStream $isoStream `
+                  -OutputStream $entryStream `
+                  -TotalBytes $isoItem.Length `
+                  -Activity 'ZIP creation'
+              } finally {
+                $entryStream.Dispose()
+                $isoStream.Dispose()
+              }
             } finally {
               $zipArchive.Dispose()
             }
           } finally {
             $zipFileStream.Dispose()
           }
+          Write-Log ("ZIP package created: {0}" -f $zipPath)
 
           $releaseAssetSummary = 'ZIP'
           $zipItem = Get-Item -LiteralPath $zipPath
@@ -395,11 +493,19 @@ jobs:
             $bufferSize = 4MB
             $buffer = New-Object byte[] $bufferSize
             $partIndex = 1
+            $totalParts = [int][Math]::Ceiling($zipItem.Length / [double]$releaseAssetSizeLimitBytes)
+            $bytesProcessed = [int64]0
+            $nextPercent = 10
+            $lastReport = Get-Date
+
+            Write-Log ("ZIP exceeds GitHub Release asset limit. Splitting {0} into {1} part(s) of up to {2}." -f (Format-Size $zipItem.Length), $totalParts, (Format-Size $releaseAssetSizeLimitBytes))
 
             $inputStream = [System.IO.File]::OpenRead($zipPath)
             try {
               while ($inputStream.Position -lt $inputStream.Length) {
                 $partPath = "{0}.{1:D3}" -f $zipPath, $partIndex
+                $partBytesWritten = [int64]0
+                Write-Log ("Starting split part {0}/{1}: {2}" -f $partIndex, $totalParts, [System.IO.Path]::GetFileName($partPath))
                 $outputStream = [System.IO.File]::Open($partPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
                 try {
                   $remainingInPart = [int64]$releaseAssetSizeLimitBytes
@@ -413,11 +519,24 @@ jobs:
 
                     $outputStream.Write($buffer, 0, $read)
                     $remainingInPart -= $read
+                    $partBytesWritten += $read
+                    $bytesProcessed += $read
+
+                    $percent = [Math]::Min(100, [int](($bytesProcessed * 100) / $zipItem.Length))
+                    $now = Get-Date
+                    if ($percent -ge $nextPercent -or ($now - $lastReport).TotalSeconds -ge 15) {
+                      Write-Log ("Split progress: {0}% ({1} / {2}), current part {3}/{4}" -f $percent, (Format-Size $bytesProcessed), (Format-Size $zipItem.Length), $partIndex, $totalParts)
+                      while ($nextPercent -le $percent) {
+                        $nextPercent += 10
+                      }
+                      $lastReport = $now
+                    }
                   }
                 } finally {
                   $outputStream.Dispose()
                 }
 
+                Write-Log ("Finished split part {0}/{1}: {2}" -f $partIndex, $totalParts, (Format-Size $partBytesWritten))
                 $partIndex++
               }
             } finally {
@@ -425,6 +544,7 @@ jobs:
             }
 
             Remove-Item -LiteralPath $zipPath -Force
+            Write-Log 'Split ZIP creation complete.'
             $releaseAssetSummary = 'Split ZIP parts (1.9 GB each, reassemble before extracting)'
           }
 
@@ -432,6 +552,8 @@ jobs:
           if ($releaseAssets.Count -eq 0) {
             throw "No release assets were produced for $env:TAG_NAME."
           }
+
+          Write-Log ("Prepared {0} release asset(s): {1}" -f $releaseAssets.Count, (($releaseAssets | ForEach-Object { $_.Name }) -join ', '))
 
           $releaseNotesPath = Join-Path $releaseAssetDir 'release-notes.txt'
           @(
@@ -448,14 +570,29 @@ jobs:
           ) | Set-Content -LiteralPath $releaseNotesPath -Encoding UTF8
 
           $releaseTitle = "Windows $env:FOUND_BUILD $env:CHANNEL $env:ARCH $env:LANGUAGE $env:EDITION"
-          $assetPaths = @($releaseAssets | ForEach-Object { $_.FullName })
+          $releaseFiles = @($releaseAssets | ForEach-Object { $_.Name })
 
-          gh release create $env:TAG_NAME @assetPaths `
-            --repo $env:GITHUB_REPOSITORY `
-            --title $releaseTitle `
-            --notes-file $releaseNotesPath
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "release_title=$releaseTitle"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "release_notes_path=$releaseNotesPath"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "release_working_directory=$releaseAssetDir"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'release_files<<EOF'
+          foreach ($releaseFile in $releaseFiles) {
+            Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value $releaseFile
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value 'EOF'
 
-          Remove-Item -LiteralPath $entryRoot -Recurse -Force
+      - name: Publish Release
+        if: ${{ steps.package.outputs.skip_release != 'true' }}
+        uses: softprops/action-gh-release@master
+        with:
+          tag_name: ${{ matrix.tag_name }}
+          name: ${{ steps.package.outputs.release_title }}
+          body_path: ${{ steps.package.outputs.release_notes_path }}
+          working_directory: ${{ steps.package.outputs.release_working_directory }}
+          files: ${{ steps.package.outputs.release_files }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          preserve_order: true
 
   Finalize:
     name: Finalize Workflow
