@@ -43,6 +43,60 @@ function Get-UupBuildMajorFromTitle {
     return [int]((Get-UupBuildNumberFromTitle -Title $Title).Split('.')[0])
 }
 
+function Get-UupWindowsProductFromTitle {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Title
+    )
+
+    $normalizedTitle = $Title.Trim()
+
+    $clientMatch = [regex]::Match($normalizedTitle, 'Windows\s+(?<version>10|11)\b')
+    if ($clientMatch.Success) {
+        $clientVersion = $clientMatch.Groups['version'].Value
+        return [ordered]@{
+            displayName = "Windows $clientVersion"
+            token       = "Windows$clientVersion"
+        }
+    }
+
+    $serverMatch = [regex]::Match($normalizedTitle, 'Windows\s+Server(?:\s+(?<version>\d{4}))?\b')
+    if ($serverMatch.Success) {
+        $serverVersion = $serverMatch.Groups['version'].Value
+        if ([string]::IsNullOrWhiteSpace($serverVersion)) {
+            return [ordered]@{
+                displayName = 'Windows Server'
+                token       = 'WindowsServer'
+            }
+        }
+
+        return [ordered]@{
+            displayName = "Windows Server $serverVersion"
+            token       = "WindowsServer$serverVersion"
+        }
+    }
+
+    $majorBuild = Get-UupBuildMajorFromTitle -Title $normalizedTitle
+    if ($majorBuild -ge 22000) {
+        return [ordered]@{
+            displayName = 'Windows 11'
+            token       = 'Windows11'
+        }
+    }
+
+    if ($majorBuild -ge 10000) {
+        return [ordered]@{
+            displayName = 'Windows 10'
+            token       = 'Windows10'
+        }
+    }
+
+    return [ordered]@{
+        displayName = 'Windows'
+        token       = 'Windows'
+    }
+}
+
 function Test-UupBuildTitle {
     param(
         [string]$Title,
@@ -282,11 +336,15 @@ if (-not (Test-UupEditionAvailable -UpdateId $candidate.updateId)) {
     throw "Edition $Edition is not available for update $($candidate.updateId) and language $Language"
 }
 
+$windowsProduct = Get-UupWindowsProductFromTitle -Title $candidate.updateTitle
+
 $result = [ordered]@{
     source      = $candidate.source
     updateId    = $candidate.updateId
     updateTitle = $candidate.updateTitle
     foundBuild  = $candidate.foundBuild
+    windowsDisplay = $windowsProduct.displayName
+    windowsToken   = $windowsProduct.token
     arch        = $Arch
     ring        = $Ring
     flight      = $Flight
