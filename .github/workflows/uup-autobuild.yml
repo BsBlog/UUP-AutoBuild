@@ -348,7 +348,6 @@ jobs:
       TAG_NAME: ${{ matrix.tag_name }}
     steps:
       - name: Prepare Release Workspace
-        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
 
@@ -373,7 +372,6 @@ jobs:
 
       - name: Package Release Assets
         id: package
-        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
 
